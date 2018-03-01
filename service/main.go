@@ -10,6 +10,16 @@ import (
 	"reflect"
 	"github.com/pborman/uuid"
 	"strings"
+	"context"
+	"cloud.google.com/go/storage"
+	//"cloud.google.com/go/bigtable"
+	"io"
+        "github.com/go-redis/redis"
+	"time"
+	"github.com/auth0/go-jwt-middleware"
+	"github.com/dgrijalva/jwt-go"
+	"github.com/gorilla/mux"
+
 )
 /*
 自动映射！！！
@@ -24,17 +34,25 @@ type Post struct{
 	User string `json:"user"`
 	Message string `json:"message"`
 	Location Location `json:"location"`
+	Url string `json:"url"`
 }
 const (
 	INDEX = "around"
 	TYPE = "post"
 	DISTANCE = "200km"
-	// Needs to update
-	//PROJECT_ID = "around-xxx"
-	//BT_INSTANCE = "around-post"
 	// Needs to update this URL if you deploy it to cloud.
-	ES_URL = "http://35.229.121.214:8081"
+	ES_URL = "http://35.185.2.152:8081"
+	// Needs to update this bucket based on your gcs bucket name.
+	BUCKET_NAME = "post-images-1707017"
+	PROJECT_ID = "sincere-stack-194922"
+	BT_INSTANCE = "around-post"
+	ENABLE_MEMCACHE = true
+	REDIS_URL = "redis-19888.c1.us-central1-2.gce.cloud.redislabs.com:19888"
+
 )
+
+//my random key, could not be known by others
+var mySigningKey = []byte("secret")
 
 func main() {
 	// Create a client
@@ -71,8 +89,24 @@ func main() {
 	}
 
 	fmt.Println("started-service")
-	http.HandleFunc("/post", handlerPost)
-	http.HandleFunc("/search", handlerSearch)
+	//Create a new router on top of the existing http router as we need to check auth.
+	r:= mux.NewRouter()
+//tell the middleware what is the key and method to decode token, mySigningKey is public and private key
+	var jwtMiddleware = jwtmiddleware.New(jwtmiddleware.Options{
+		ValidationKeyGetter:func(token *jwt.Token) (interface{}, error) {
+			return mySigningKey, nil
+		},
+		SigningMethod:jwt.SigningMethodHS256,
+	})
+
+	r.Handle("/post",jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle("/search",jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
+
+	//Bothe login and signup are the first time, don't need token
+	r.Handle("/login",http.HandlerFunc(loginHandler)).Methods("POST")
+	r.Handle("/signup",http.HandlerFunc(signupHandler)).Methods("POST")
+
+	http.Handle("/",r)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 
 }
@@ -89,6 +123,27 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Printf( "Search received: %f %f %s\n", lat, lon, ran)
+
+	//redis catch
+	key := r.URL.Query().Get("lat") + ":" + r.URL.Query().Get("lon") + ":" + ran
+	if ENABLE_MEMCACHE {
+		rs_client := redis.NewClient(&redis.Options{
+			Addr:     REDIS_URL,
+			Password: "", // no password set
+			DB:       0,  // use default DB
+		})
+
+		val, err := rs_client.Get(key).Result()
+		if err != nil {
+			fmt.Printf("Redis cannot find the key %s as %v.\n", key, err)
+		} else {
+			fmt.Printf("Redis find the key %s.\n", key)
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(val))
+			return
+		}
+	}
+
 
 	// Create a client,connect to google cloud platform
 	client, err := elastic.NewClient(elastic.SetURL(ES_URL), elastic.SetSniff(false))
@@ -139,6 +194,19 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 		return
 	}
+        //save posts to catch
+	if ENABLE_MEMCACHE {
+		rs_client := redis.NewClient(&redis.Options{
+			Addr:     REDIS_URL,
+			Password: "", // no password set
+			DB:       0,  // use default DB
+		})
+		err := rs_client.Set(key,string(js),time.Second*30).Err()
+		if err !=nil {
+			fmt.Printf("Redis cannot save the key %s as %v.\n", key, err)
+		}
+
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -159,18 +227,116 @@ func containsFilteredWords(s *string) bool {
 }
 
 func handlerPost(w http.ResponseWriter, r *http.Request) {
-	// Parse from body of request to get a json object.
-	fmt.Println("Received one post request")
-	decoder := json.NewDecoder(r.Body)
-	var p Post
-	if err := decoder.Decode(&p); err != nil {
-		panic(err)
-		return
+	// the post structure is multipart form, key->value pair
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	user :=r.Context().Value("user")
+	claims:=user.(*jwt.Token).Claims
+	username :=claims.(jwt.MapClaims)["username"]
+	// 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
+	// After you call ParseMultipartForm, the file will be saved in the server memory with maxMemory size.
+	// If the file size is larger than maxMemory, the rest of the data will be saved in a system temporary file.
+	r.ParseMultipartForm(32 << 20)
+
+	// Parse from form data.
+	//fmt.Printf("Received one post request %s\n", r.FormValue("message"))
+	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
+	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
+	p := &Post{
+		User:    username.(string),
+		Message: r.FormValue("message"),
+		Location: Location{
+			Lat: lat,
+			Lon: lon,
+		},
 	}
 
 	id := uuid.New()
+
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		http.Error(w, "Image is not available", http.StatusInternalServerError)
+		fmt.Printf("Image is not available %v.\n", err)
+		return
+	}
+	defer file.Close()
+
+	ctx := context.Background()
+
+	// replace it with your real bucket name.
+	_, attrs, err := saveToGCS(ctx, file, BUCKET_NAME, id)
+	if err != nil {
+		http.Error(w, "GCS is not setup", http.StatusInternalServerError)
+		fmt.Printf("GCS is not setup %v\n", err)
+		return
+	}
+
+	// Update the media link after saving to GCS.
+	p.Url = attrs.MediaLink
+
 	// Save to ES.
-	saveToES(&p, id)
+	saveToES(p, id)
+
+	// Save to BigTable.
+	/*
+	bt_client,err := bigtable.NewClient(ctx,PROJECT_ID, BT_INSTANCE)
+	if err != nil {
+		panic(err)
+		return
+	}
+	//saveToBigTable(p, id)
+	tbl := bt_client.Open("post")
+	mut := bigtable.NewMutation()
+	//timestamp
+	t := bigtable.Now()
+
+	mut.Set("post","user",t,[]byte(p.User))
+	mut.Set("post","message",t, []byte(p.Message))
+	mut.Set("location","lat",t,[]byte(strconv.FormatFloat(p.Location.Lat, 'f', -1, 64)))
+	mut.Set("location", "lon", t, []byte(strconv.FormatFloat(p.Location.Lon, 'f', -1, 64)))
+
+	err = tbl.Apply(ctx,id,mut)
+	if err != nil {
+		panic(err)
+		return
+	}
+	fmt.Printf("Post is saved to BigTable: %s\n", p.Message)
+*/
+}
+func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string) (*storage.ObjectHandle, *storage.ObjectAttrs, error) {
+	//create a GCS client
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	//execute this line before return this function
+	defer client.Close()
+	//create a bucket
+	bucket := client.Bucket(bucketName)
+	// Next check if the bucket exists
+	if _, err = bucket.Attrs(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	obj := bucket.Object(name)
+	w := obj.NewWriter(ctx)
+	if _, err := io.Copy(w, r); err != nil {
+		return nil, nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, nil, err
+	}
+
+	//change the access 权限，all users could read this file
+	if err := obj.ACL().Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
+		return nil, nil, err
+	}
+
+	attrs, err := obj.Attrs(ctx)
+	fmt.Printf("Post is saved to GCS: %s\n", attrs.MediaLink)
+	return obj, attrs, err
 
 }
 
